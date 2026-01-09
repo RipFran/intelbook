@@ -119,7 +119,7 @@ output/
   credentials_all.txt   (optional, cumulative merged)
 ```
 
-* Each per-query folder represents the exact query used. If the query is already filesystem-safe, the folder name is the query itself (e.g., example.com, user@example.org). If the query contains characters that are unsafe for folder names (e.g., *, ?, :, /), the tool creates a readable slug and appends a short deterministic hash suffix to avoid .
+* Each per-query folder represents the exact query used. If the query is already filesystem-safe, the folder name is the query itself (e.g., example.com, user@example.org). If the query contains characters that are unsafe for folder names (e.g., *, ?, :, /), the tool creates a readable slug and appends a short deterministic hash suffix.
 * The `*_all.txt` files are deduplicated merges across all processed domains.
 
 ## Operational notes
