@@ -50,31 +50,27 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Single domain (default: emails + domains + urls + credentials)
+### Single domain (default: emails + domains + urls)
 
 ```bash
 python intelbook.py --api-key YOUR_INTELX_KEY --input example.com
 ```
 
-### Only emails and URLs
-
-```bash
-python intelbook.py --api-key YOUR_INTELX_KEY --input example.com --types emails,urls
-```
-
 > [!NOTE]
 > **Credential-bearing URL selectors**
 >
-> In some IntelX Phonebook responses, URL selectors may include **appended sensitive data**. It is not always `username:password`; it can also be **cookies**, **tokens**, or **session IDs**. Common shapes include:
->
-> - `http://site.tld/path:username:password`
-> - `http://site.tld/path:jsessionid=...:...:...`
-> - (edge cases) `http://site.tld/:token:token`
+> In some IntelX Phonebook responses, URL selectors may include **appended sensitive data**. It is not always `username:password`; it can also be **cookies**, **tokens**, or **session IDs**. 
 >
 > To keep the URL list clean without losing that data, when `urls` is included in `--types`:
 >
 > - `urls*.txt` contains the **sanitized base URL** (with appended credentials/tokens removed).
 > - `credentials*.txt` contains the **original raw entry** exactly as returned by Phonebook (with appended credentials/tokens).
+
+### Only emails and urls
+
+```bash
+python intelbook.py --api-key YOUR_INTELX_KEY --input example.com --types emails,urls
+```
 
 ### Multiple domains from file
 
