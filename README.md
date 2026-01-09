@@ -5,9 +5,9 @@ Python CLI tool to query **IntelX Phonebook** and extract:
 - Email addresses
 - Domains
 - URLs
-- Credentials
+- Credentials (credential-bearing URL selectors preserved separately)
 
-It supports a single domain or a file containing multiple domains, writes per-domain outputs, and also produces merged output files in the root output folder.
+It supports a single **query** or a file containing multiple queries, writes per-query outputs, and also produces merged output files in the root output folder.
 
 ## Documentation references
 
@@ -50,10 +50,10 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Single domain (default: emails + domains + urls)
+### Single query (default: emails + domains + urls + credentials)
 
 ```bash
-python intelbook.py --api-key YOUR_INTELX_KEY --input example.com
+python intelbook.py --api-key YOUR_INTELX_KEY --query example.com
 ```
 
 > [!NOTE]
@@ -69,31 +69,33 @@ python intelbook.py --api-key YOUR_INTELX_KEY --input example.com
 ### Only emails and urls
 
 ```bash
-python intelbook.py --api-key YOUR_INTELX_KEY --input example.com --types emails,urls
+python intelbook.py --api-key YOUR_INTELX_KEY --query example.com --types emails,urls
 ```
 
-### Multiple domains from file
+### Multiple queries from file
 
-Create `domains.txt`:
+Create `queries.txt`:
 
 ```txt
 example.com
 example.org
 # comments are allowed
 sub.example.net
+*.example.com
+user@example.org
 ```
 
 Run:
 
 ```bash
-python intelbook.py --api-key YOUR_INTELX_KEY --input domains.txt --types emails,domains,urls
+python intelbook.py --api-key YOUR_INTELX_KEY --query queries.txt --types emails,domains,urls
 ```
 
 ### Environment variable (optional)
 
 ```bash
 export INTELX_API_KEY="YOUR_INTELX_KEY"
-python intelbook.py --input example.com
+python intelbook.py --query example.com
 ```
 
 ## Output structure
@@ -102,22 +104,22 @@ By default, the tool writes into `./output`:
 
 ```
 output/
-  example.com/
-    emails.txt          (optional)
-    domains.txt         (optional)
-    urls.txt            (optional)
-    credentials.txt     (optional, URLs with credentials)
+  <query-folder>/
+    emails.txt          (optional, cumulative)
+    domains.txt         (optional, cumulative)
+    urls.txt            (optional, cumulative)
+    credentials.txt     (optional, cumulative; URLs with credentials/tokens)
 
-  example.org/
+  <another-query-folder>/
     ...
 
-  emails_all.txt        (optional, merged)
-  domains_all.txt       (optional, merged)
-  urls_all.txt          (optional, merged)
-  credentials_all.txt   (optional, merged)
+  emails_all.txt        (optional, cumulative merged)
+  domains_all.txt       (optional, cumulative merged)
+  urls_all.txt          (optional, cumulative merged)
+  credentials_all.txt   (optional, cumulative merged)
 ```
 
-* Each per-domain folder is named after the input domain.
+* Each per-query folder represents the exact query used. If the query is already filesystem-safe, the folder name is the query itself (e.g., example.com, user@example.org). If the query contains characters that are unsafe for folder names (e.g., *, ?, :, /), the tool creates a readable slug and appends a short deterministic hash suffix to avoid .
 * The `*_all.txt` files are deduplicated merges across all processed domains.
 
 ## Operational notes
@@ -132,3 +134,9 @@ output/
 * `0`: Success
 * `2`: Invalid CLI usage or missing inputs
 * Non-zero runtime exceptions may also occur if the API returns errors (e.g., 401 unauthorized, 402 credits exhausted).
+
+## Screenshots
+
+### Results example
+
+![Results example](media/results.png)

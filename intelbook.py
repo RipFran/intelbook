@@ -3,8 +3,9 @@
 intelbook.py
 
 IntelX Phonebook CLI:
-- Queries Phonebook for emails, domains, and/or URLs for one or more domains.
-- Writes per-domain outputs and merged outputs.
+- Queries Phonebook for emails, domains, and/or URLs for one or more search terms.
+- Writes per-query outputs and merged outputs.
+- Output files are cumulative: existing results are preserved and new results are merged.
 - Implements correct polling logic based on IntelX Phonebook status codes:
   0: Success with results (keep polling/paging)
   1: Finished, no future results (stop; may still include records)
@@ -18,6 +19,7 @@ Docs:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import logging
@@ -103,26 +105,98 @@ def sanitize_for_dirname(s: str) -> str:
     return s or "unknown"
 
 
-def read_domains_from_file(path: str) -> List[str]:
-    domains: List[str] = []
+_WINDOWS_INVALID_CHARS = set('<>:"/\\|?*')
+
+
+def _is_fs_safe_dirname(name: str) -> bool:
+    if not name:
+        return False
+    # Windows forbids these characters in file/folder names, and control chars are problematic cross-platform.
+    for ch in name:
+        if ch in _WINDOWS_INVALID_CHARS or ord(ch) < 32:
+            return False
+    # Windows also forbids trailing spaces and periods.
+    if name.endswith(" ") or name.endswith("."):
+        return False
+    # Avoid path separator usage.
+    if "/" in name or "\\" in name:
+        return False
+    return True
+
+
+def build_query_dirname(query: str) -> str:
+    """
+    Folder name should represent the query as closely as possible.
+    If the query contains filesystem-invalid characters (e.g., '*', '?', ':'), it will be transformed into a
+    readable slug, and a short deterministic suffix is added to prevent collisions.
+    """
+    q = query.strip()
+    if not q:
+        return "unknown"
+
+    if _is_fs_safe_dirname(q):
+        return q
+
+    # Create a readable slug that preserves intent for common special characters.
+    slug = q
+    slug = slug.replace("*", "_wildcard_")
+    slug = slug.replace("?", "_qmark_")
+    slug = slug.replace(":", "_colon_")
+    slug = slug.replace("|", "_pipe_")
+    slug = slug.replace("\\", "_")
+    slug = slug.replace("/", "_")
+    slug = slug.replace('"', "_quote_")
+    slug = slug.replace("<", "_lt_")
+    slug = slug.replace(">", "_gt_")
+
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", slug).strip("._-")
+    if not slug:
+        slug = "query"
+
+    # Keep it reasonably short for cross-platform filesystems.
+    if len(slug) > 80:
+        slug = slug[:80].rstrip("._-")
+        if not slug:
+            slug = "query"
+
+    digest = hashlib.sha1(q.encode("utf-8", errors="replace")).hexdigest()[:10]
+    return f"{slug}__{digest}"
+
+
+def read_queries_from_file(path: str) -> List[str]:
+    queries: List[str] = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            d = normalize_domain(line)
-            if d:
-                domains.append(d)
-    return domains
+            queries.append(line)
+    return queries
 
 
 def write_sorted_unique(path: str, values: Iterable[str]) -> int:
-    uniq = sorted({v.strip() for v in values if v and v.strip()})
+    """
+    Cumulative writer: preserves any existing values in `path`, merges with `values`,
+    then writes back sorted unique lines.
+    """
+    incoming = {v.strip() for v in values if v and v.strip()}
+
+    existing: Set[str] = set()
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    existing.add(line)
+
+    merged = sorted(existing | incoming)
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        for v in uniq:
+        for v in merged:
             f.write(v + "\n")
-    return len(uniq)
+
+    return len(merged)
 
 
 def safe_body(resp: Response, max_len: int = 2000) -> str:
@@ -590,7 +664,7 @@ def extract_selectors(records: List[Dict[str, Any]]) -> Tuple[Set[str], Set[str]
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="intelbook.py",
-        description="Query IntelX Phonebook for URLs, domains, and email addresses for one or more domains.",
+        description="Query IntelX Phonebook for URLs, domains, and email addresses for one or more search terms.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -603,16 +677,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-url", default="https://2.intelx.io", help="IntelX API base URL (paid commonly uses 2.intelx.io).")
     p.add_argument("--user-agent", default="intelbook/1.1", help="User-Agent header (required by IntelX).")
 
-    p.add_argument("--input", required=True, help="Input domain OR a file containing one domain per line.")
+    p.add_argument(
+        "--query",
+        required=True,
+        help="Search term (domain, email, URL, wildcard, etc.) OR a file containing one search term per line.",
+    )
     p.add_argument("--types", default="emails,domains,urls", help="Comma-separated list: emails, domains, urls.")
     p.add_argument("--output-dir", default="output", help="Root output directory.")
-
-    p.add_argument(
-        "--term-mode",
-        choices=["wildcard", "exact", "both"],
-        default="wildcard",
-        help="How to build the selector term for Phonebook. wildcard => *.domain, exact => domain, both => both terms merged.",
-    )
 
     p.add_argument("--maxresults", type=int, default=10000, help="Phonebook maxresults parameter per search.")
     p.add_argument("--result-limit", type=int, default=200, help="Phonebook result page size (limit parameter).")
@@ -639,21 +710,6 @@ def parse_types(types_csv: str) -> List[str]:
     return [t for t in order if t in set(items)]
 
 
-def build_terms(domain: str, mode: str) -> List[str]:
-    domain = normalize_domain(domain)
-    if not domain:
-        return []
-    wildcard = domain if domain.startswith("*.") else f"*.{domain}"
-    if mode == "wildcard":
-        return [wildcard]
-    if mode == "exact":
-        return [domain]
-    # both
-    if wildcard == domain:
-        return [domain]
-    return [domain, wildcard]
-
-
 def main() -> int:
     args = build_arg_parser().parse_args()
     log = configure_logging(args.verbose)
@@ -670,19 +726,18 @@ def main() -> int:
         console.print(f"[bold red]Error:[/bold red] {e}")
         return 2
 
-    # Load domains
-    input_value = args.input.strip()
+    # Load queries
+    input_value = args.query.strip()
     if os.path.isfile(input_value):
-        domains = read_domains_from_file(input_value)
-        if not domains:
-            console.print("[bold red]Error:[/bold red] Input file contained no valid domains.")
+        queries = read_queries_from_file(input_value)
+        if not queries:
+            console.print("[bold red]Error:[/bold red] Input file contained no valid queries.")
             return 2
     else:
-        d = normalize_domain(input_value)
-        if not d:
-            console.print("[bold red]Error:[/bold red] Input domain is empty or invalid.")
+        if not input_value:
+            console.print("[bold red]Error:[/bold red] Query is empty or invalid.")
             return 2
-        domains = [d]
+        queries = [input_value]
 
     output_root = os.path.abspath(args.output_dir)
     os.makedirs(output_root, exist_ok=True)
@@ -704,9 +759,8 @@ def main() -> int:
 
     console.rule("[bold]IntelX Phonebook Extraction[/bold]")
     console.print(f"Base URL      : {args.base_url}")
-    console.print(f"Domains       : {len(domains)}")
+    console.print(f"Queries       : {len(queries)}")
     console.print(f"Types         : {', '.join(wanted_types)}")
-    console.print(f"Term mode     : {args.term_mode}")
     console.print(f"Output dir    : {output_root}")
     console.print(f"Rate limit    : {args.rps:.2f} req/s")
     console.print("")
@@ -722,76 +776,73 @@ def main() -> int:
         console=console,
         transient=False,
     ) as progress:
-        task = progress.add_task("Processing domains", total=len(domains))
+        task = progress.add_task("Processing queries", total=len(queries))
 
-        for domain in domains:
-            console.rule(f"[bold]Domain:[/bold] {domain}")
-            domain_dir = os.path.join(output_root, sanitize_for_dirname(domain))
-            os.makedirs(domain_dir, exist_ok=True)
+        for query in queries:
+            console.rule(f"[bold]Query:[/bold] {query}")
+            query_dir = os.path.join(output_root, build_query_dirname(query))
+            os.makedirs(query_dir, exist_ok=True)
 
-            domain_emails: Set[str] = set()
-            domain_domains: Set[str] = set()
-            domain_urls: Set[str] = set()
-            domain_credentials: Set[str] = set()
+            query_emails: Set[str] = set()
+            query_domains: Set[str] = set()
+            query_urls: Set[str] = set()
+            query_credentials: Set[str] = set()
 
-            terms = build_terms(domain, args.term_mode)
-            if not terms:
-                console.print("  [bold red]Skipping:[/bold red] could not build a valid term for this domain.")
+            term = query.strip()
+            if not term:
+                console.print("  [bold red]Skipping:[/bold red] query is empty after trimming.")
                 progress.update(task, advance=1)
                 continue
 
             for out_type in wanted_types:
                 target = TYPE_TO_TARGET[out_type]
                 console.print(f"- Query type: [bold]{out_type}[/bold] (target={target})")
+                console.print(f"  Starting Phonebook search for term: {term}")
+
+                search_id = ""
+                try:
+                    search_id = client.phonebook_search(
+                        term=term,
+                        target=target,
+                        maxresults=args.maxresults,
+                        timeout_s=args.pb_timeout,
+                    )
+                    console.print(f"  Search ID: {search_id}")
+                except Exception as e:
+                    console.print(f"  [bold red]Failed[/bold red] to start search: {e}")
+                    continue
+
+                debug_path = None
+                if args.json_debug:
+                    debug_path = os.path.join(query_dir, f"debug_last_{out_type}_{sanitize_for_dirname(term)}.json")
 
                 combined_records: List[Dict[str, Any]] = []
-
-                for term in terms:
-                    console.print(f"  Starting Phonebook search for term: {term}")
-
-                    search_id = ""
-                    try:
-                        search_id = client.phonebook_search(
-                            term=term,
-                            target=target,
-                            maxresults=args.maxresults,
-                            timeout_s=args.pb_timeout,
-                        )
-                        console.print(f"  Search ID: {search_id}")
-                    except Exception as e:
-                        console.print(f"  [bold red]Failed[/bold red] to start search: {e}")
-                        continue
-
-                    debug_path = None
-                    if args.json_debug:
-                        debug_path = os.path.join(domain_dir, f"debug_last_{out_type}_{sanitize_for_dirname(term)}.json")
-
-                    try:
-                        records = client.phonebook_fetch_all(
-                            search_id=search_id,
-                            limit=args.result_limit,
-                            poll_interval_s=args.poll_interval,
-                            max_wait_s=args.max_wait,
-                            debug_dump_path=debug_path,
-                        )
-                        combined_records.extend(records)
-                        console.print(f"  Finished: fetched {len(records)} raw record(s)")
-                    except TimeoutError as e:
-                        console.print(f"  [bold yellow]Timeout[/bold yellow]: {e}")
-                        if search_id:
-                            client.terminate_search(search_id)
-                            console.print("  Best-effort cleanup: search terminated.")
-                    except Exception as e:
-                        console.print(f"  [bold red]Failed[/bold red] to fetch results: {e}")
-                        continue
+                try:
+                    records = client.phonebook_fetch_all(
+                        search_id=search_id,
+                        limit=args.result_limit,
+                        poll_interval_s=args.poll_interval,
+                        max_wait_s=args.max_wait,
+                        debug_dump_path=debug_path,
+                    )
+                    combined_records.extend(records)
+                    console.print(f"  Finished: fetched {len(records)} raw record(s)")
+                except TimeoutError as e:
+                    console.print(f"  [bold yellow]Timeout[/bold yellow]: {e}")
+                    if search_id:
+                        client.terminate_search(search_id)
+                        console.print("  Best-effort cleanup: search terminated.")
+                except Exception as e:
+                    console.print(f"  [bold red]Failed[/bold red] to fetch results: {e}")
+                    continue
 
                 # Extract selectors from combined records for this type
                 e_set, d_set, u_set = extract_selectors(combined_records)
 
                 if out_type == "emails":
-                    domain_emails |= e_set
+                    query_emails |= e_set
                 elif out_type == "domains":
-                    domain_domains |= d_set
+                    query_domains |= d_set
                 elif out_type == "urls":
                     sanitized_urls: Set[str] = set()
                     cred_urls: Set[str] = set()
@@ -803,27 +854,29 @@ def main() -> int:
                                 sanitized_urls.add(base_url)
                         else:
                             sanitized_urls.add(u)
-                    domain_urls |= sanitized_urls
-                    domain_credentials |= cred_urls
+                    query_urls |= sanitized_urls
+                    query_credentials |= cred_urls
 
-                console.print(f"  Post-processed totals for this query: emails={len(e_set)}, domains={len(d_set)}, urls={len(u_set)}")
+                console.print(
+                    f"  Post-processed totals for this query: emails={len(e_set)}, domains={len(d_set)}, urls={len(u_set)}"
+                )
 
-            # Write per-domain files
+            # Write per-query files (cumulative)
             written: Dict[str, int] = {}
             if "emails" in wanted_types:
-                written["emails"] = write_sorted_unique(os.path.join(domain_dir, "emails.txt"), domain_emails)
+                written["emails"] = write_sorted_unique(os.path.join(query_dir, "emails.txt"), query_emails)
             if "domains" in wanted_types:
-                written["domains"] = write_sorted_unique(os.path.join(domain_dir, "domains.txt"), domain_domains)
+                written["domains"] = write_sorted_unique(os.path.join(query_dir, "domains.txt"), query_domains)
             if "urls" in wanted_types:
-                written["urls"] = write_sorted_unique(os.path.join(domain_dir, "urls.txt"), domain_urls)
-                written["credentials"] = write_sorted_unique(os.path.join(domain_dir, "credentials.txt"), domain_credentials)
+                written["urls"] = write_sorted_unique(os.path.join(query_dir, "urls.txt"), query_urls)
+                written["credentials"] = write_sorted_unique(os.path.join(query_dir, "credentials.txt"), query_credentials)
 
-            all_emails |= domain_emails
-            all_domains |= domain_domains
-            all_urls |= domain_urls
-            all_credentials |= domain_credentials
+            all_emails |= query_emails
+            all_domains |= query_domains
+            all_urls |= query_urls
+            all_credentials |= query_credentials
 
-            t = Table(title="Domain summary", show_header=True, header_style="bold")
+            t = Table(title="Query summary", show_header=True, header_style="bold")
             t.add_column("Type")
             t.add_column("Count", justify="right")
             for k in ["emails", "domains", "urls"]:
@@ -837,21 +890,21 @@ def main() -> int:
 
     console.rule("[bold]Writing merged outputs[/bold]")
     if "emails" in wanted_types:
-        write_sorted_unique(os.path.join(output_root, "emails_all.txt"), all_emails)
-        console.print(f"- emails_all.txt  : {len(all_emails)}")
+        n = write_sorted_unique(os.path.join(output_root, "emails_all.txt"), all_emails)
+        console.print(f"- emails_all.txt  : {n}")
     if "domains" in wanted_types:
-        write_sorted_unique(os.path.join(output_root, "domains_all.txt"), all_domains)
-        console.print(f"- domains_all.txt : {len(all_domains)}")
+        n = write_sorted_unique(os.path.join(output_root, "domains_all.txt"), all_domains)
+        console.print(f"- domains_all.txt : {n}")
     if "urls" in wanted_types:
-        write_sorted_unique(os.path.join(output_root, "urls_all.txt"), all_urls)
-        write_sorted_unique(os.path.join(output_root, "credentials_all.txt"), all_credentials)
-        console.print(f"- urls_all.txt    : {len(all_urls)}")
-        console.print(f"- credentials_all.txt : {len(all_credentials)}")
+        n_urls = write_sorted_unique(os.path.join(output_root, "urls_all.txt"), all_urls)
+        n_creds = write_sorted_unique(os.path.join(output_root, "credentials_all.txt"), all_credentials)
+        console.print(f"- urls_all.txt    : {n_urls}")
+        console.print(f"- credentials_all.txt : {n_creds}")
 
     elapsed = time.time() - start_ts
     console.rule("[bold]Completed[/bold]")
     summary = Table(show_header=False)
-    summary.add_row("Domains processed", str(len(domains)))
+    summary.add_row("Queries processed", str(len(queries)))
     summary.add_row("Elapsed time", f"{elapsed:.1f}s")
     summary.add_row("Output directory", output_root)
     console.print(summary)
@@ -861,4 +914,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
