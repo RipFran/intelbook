@@ -5,6 +5,7 @@ Python CLI tool to query **IntelX Phonebook** and extract:
 - Email addresses
 - Domains
 - URLs
+- Credentials
 
 It supports a single domain or a file containing multiple domains, writes per-domain outputs, and also produces merged output files in the root output folder.
 
@@ -49,7 +50,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Single domain (default: emails + domains + urls)
+### Single domain (default: emails + domains + urls + credentials)
 
 ```bash
 python intelbook.py --api-key YOUR_INTELX_KEY --input example.com
@@ -60,6 +61,20 @@ python intelbook.py --api-key YOUR_INTELX_KEY --input example.com
 ```bash
 python intelbook.py --api-key YOUR_INTELX_KEY --input example.com --types emails,urls
 ```
+
+> [!NOTE]
+> **Credential-bearing URL selectors**
+>
+> In some IntelX Phonebook responses, URL selectors may include **appended sensitive data**. It is not always `username:password`; it can also be **cookies**, **tokens**, or **session IDs**. Common shapes include:
+>
+> - `http://site.tld/path:username:password`
+> - `http://site.tld/path:jsessionid=...:...:...`
+> - (edge cases) `http://site.tld/:token:token`
+>
+> To keep the URL list clean without losing that data, when `urls` is included in `--types`:
+>
+> - `urls*.txt` contains the **sanitized base URL** (with appended credentials/tokens removed).
+> - `credentials*.txt` contains the **original raw entry** exactly as returned by Phonebook (with appended credentials/tokens).
 
 ### Multiple domains from file
 
@@ -95,6 +110,7 @@ output/
     emails.txt          (optional)
     domains.txt         (optional)
     urls.txt            (optional)
+    credentials.txt     (optional, URLs with credentials)
 
   example.org/
     ...
@@ -102,6 +118,7 @@ output/
   emails_all.txt        (optional, merged)
   domains_all.txt       (optional, merged)
   urls_all.txt          (optional, merged)
+  credentials_all.txt   (optional, merged)
 ```
 
 * Each per-domain folder is named after the input domain.

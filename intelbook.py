@@ -135,6 +135,121 @@ def safe_body(resp: Response, max_len: int = 2000) -> str:
 
 
 # -----------------------------
+# URL credential handling
+# -----------------------------
+def _is_valid_port(value: str) -> bool:
+    if not value.isdigit():
+        return False
+    try:
+        port = int(value)
+    except ValueError:
+        return False
+    return 1 <= port <= 65535
+
+
+def _find_credential_colon(raw_url: str, start_idx: int) -> Optional[int]:
+    for idx in range(start_idx, len(raw_url)):
+        if raw_url[idx] != ":":
+            continue
+        suffix = raw_url[idx + 1 :]
+        if not suffix:
+            continue
+        if "://" in suffix:
+            continue
+        if any(ch in suffix for ch in "/?#"):
+            continue
+        return idx
+    return None
+
+
+def _split_authority_credentials(raw_url: str, scheme_end: int) -> Tuple[str, Optional[str]]:
+    authority = raw_url[scheme_end:]
+    if not authority:
+        return raw_url, None
+
+    userinfo = ""
+    hostport = authority
+    if "@" in authority:
+        userinfo, hostport = authority.rsplit("@", 1)
+        userinfo = userinfo + "@"
+
+    host = hostport
+    rest = ""
+
+    if hostport.startswith("["):
+        end = hostport.find("]")
+        if end == -1:
+            return raw_url, None
+        host = hostport[: end + 1]
+        rest = hostport[end + 1 :]
+        if rest.startswith(":"):
+            rest = rest[1:]
+        else:
+            rest = ""
+    else:
+        if ":" not in hostport:
+            return raw_url, None
+        host, rest = hostport.split(":", 1)
+
+    if not rest:
+        return raw_url, None
+
+    tokens = rest.split(":")
+    if len(tokens) >= 2:
+        if _is_valid_port(tokens[0]):
+            base = raw_url[:scheme_end] + userinfo + host + ":" + tokens[0]
+            return base, ":".join(tokens[1:])
+        base = raw_url[:scheme_end] + userinfo + host
+        return base, ":".join(tokens)
+
+    if _is_valid_port(tokens[0]):
+        return raw_url, None
+
+    base = raw_url[:scheme_end] + userinfo + host
+    return base, tokens[0]
+
+
+def split_url_credentials(raw_url: str) -> Tuple[str, Optional[str]]:
+    raw_url = raw_url.strip()
+    if not raw_url or "://" not in raw_url:
+        return raw_url, None
+
+    scheme_idx = raw_url.find("://")
+    scheme_end = scheme_idx + 3
+
+    authority_end = len(raw_url)
+    for ch in "/?#":
+        idx = raw_url.find(ch, scheme_end)
+        if idx != -1:
+            authority_end = min(authority_end, idx)
+
+    cred_hint: Optional[str] = None
+    authority = raw_url[scheme_end:authority_end]
+    if "@" in authority:
+        userinfo, hostport = authority.rsplit("@", 1)
+        cred_hint = userinfo
+        raw_url = raw_url[:scheme_end] + hostport + raw_url[authority_end:]
+        authority_end = scheme_end + len(hostport)
+
+    if authority_end < len(raw_url):
+        split_idx = _find_credential_colon(raw_url, authority_end + 1)
+        if split_idx is not None:
+            return raw_url[:split_idx], raw_url[split_idx + 1 :]
+        if cred_hint is not None:
+            return raw_url, cred_hint
+        return raw_url, None
+
+    base, suffix = _split_authority_credentials(raw_url, scheme_end)
+    if suffix is not None:
+        return base, suffix
+
+    if cred_hint is not None:
+        return raw_url, cred_hint
+
+    return raw_url, None
+
+
+# -----------------------------
 # Rate limiter
 # -----------------------------
 @dataclass
@@ -585,6 +700,7 @@ def main() -> int:
     all_emails: Set[str] = set()
     all_domains: Set[str] = set()
     all_urls: Set[str] = set()
+    all_credentials: Set[str] = set()
 
     console.rule("[bold]IntelX Phonebook Extraction[/bold]")
     console.print(f"Base URL      : {args.base_url}")
@@ -616,6 +732,7 @@ def main() -> int:
             domain_emails: Set[str] = set()
             domain_domains: Set[str] = set()
             domain_urls: Set[str] = set()
+            domain_credentials: Set[str] = set()
 
             terms = build_terms(domain, args.term_mode)
             if not terms:
@@ -676,7 +793,18 @@ def main() -> int:
                 elif out_type == "domains":
                     domain_domains |= d_set
                 elif out_type == "urls":
-                    domain_urls |= u_set
+                    sanitized_urls: Set[str] = set()
+                    cred_urls: Set[str] = set()
+                    for u in u_set:
+                        base_url, cred = split_url_credentials(u)
+                        if cred is not None:
+                            cred_urls.add(u)
+                            if base_url:
+                                sanitized_urls.add(base_url)
+                        else:
+                            sanitized_urls.add(u)
+                    domain_urls |= sanitized_urls
+                    domain_credentials |= cred_urls
 
                 console.print(f"  Post-processed totals for this query: emails={len(e_set)}, domains={len(d_set)}, urls={len(u_set)}")
 
@@ -688,10 +816,12 @@ def main() -> int:
                 written["domains"] = write_sorted_unique(os.path.join(domain_dir, "domains.txt"), domain_domains)
             if "urls" in wanted_types:
                 written["urls"] = write_sorted_unique(os.path.join(domain_dir, "urls.txt"), domain_urls)
+                written["credentials"] = write_sorted_unique(os.path.join(domain_dir, "credentials.txt"), domain_credentials)
 
             all_emails |= domain_emails
             all_domains |= domain_domains
             all_urls |= domain_urls
+            all_credentials |= domain_credentials
 
             t = Table(title="Domain summary", show_header=True, header_style="bold")
             t.add_column("Type")
@@ -699,6 +829,8 @@ def main() -> int:
             for k in ["emails", "domains", "urls"]:
                 if k in wanted_types:
                     t.add_row(k, str(written.get(k, 0)))
+            if "urls" in wanted_types:
+                t.add_row("credentials", str(written.get("credentials", 0)))
             console.print(t)
 
             progress.update(task, advance=1)
@@ -712,7 +844,9 @@ def main() -> int:
         console.print(f"- domains_all.txt : {len(all_domains)}")
     if "urls" in wanted_types:
         write_sorted_unique(os.path.join(output_root, "urls_all.txt"), all_urls)
+        write_sorted_unique(os.path.join(output_root, "credentials_all.txt"), all_credentials)
         console.print(f"- urls_all.txt    : {len(all_urls)}")
+        console.print(f"- credentials_all.txt : {len(all_credentials)}")
 
     elapsed = time.time() - start_ts
     console.rule("[bold]Completed[/bold]")
@@ -727,3 +861,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
