@@ -174,6 +174,18 @@ def read_queries_from_file(path: str) -> List[str]:
     return queries
 
 
+def read_lines_set(path: str) -> Set[str]:
+    values: Set[str] = set()
+    if not os.path.isfile(path):
+        return values
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                values.add(line)
+    return values
+
+
 def write_sorted_unique(path: str, values: Iterable[str]) -> int:
     """
     Cumulative writer: preserves any existing values in `path`, merges with `values`,
@@ -233,6 +245,28 @@ def _find_credential_colon(raw_url: str, start_idx: int) -> Optional[int]:
         if any(ch in suffix for ch in "/?#"):
             continue
         return idx
+    return None
+
+
+def _find_credential_comma(raw_url: str, start_idx: int) -> Optional[int]:
+    """
+    IntelX Phonebook sometimes returns URL selectors with appended data separated by commas, e.g.:
+      https://host/path/,user,pass
+      https://host/path/,,  (missing user/pass)
+    We treat a comma as a credential delimiter only when the suffix looks like a credential list:
+    - Suffix is empty, OR it contains at least one more comma (i.e., at least two fields),
+    - Suffix contains no URL structural delimiters (/ ? #) and does not contain a nested scheme (://).
+    """
+    for idx in range(start_idx, len(raw_url)):
+        if raw_url[idx] != ",":
+            continue
+        suffix = raw_url[idx + 1 :]  # may be empty
+        if "://" in suffix:
+            continue
+        if any(ch in suffix for ch in "/?#"):
+            continue
+        if suffix == "" or ("," in suffix):
+            return idx
     return None
 
 
@@ -304,6 +338,11 @@ def split_url_credentials(raw_url: str) -> Tuple[str, Optional[str]]:
         cred_hint = userinfo
         raw_url = raw_url[:scheme_end] + hostport + raw_url[authority_end:]
         authority_end = scheme_end + len(hostport)
+
+    # Comma-based credential splitting (e.g., URL,user,pass)
+    comma_idx = _find_credential_comma(raw_url, scheme_end)
+    if comma_idx is not None:
+        return raw_url[:comma_idx], raw_url[comma_idx + 1 :]
 
     if authority_end < len(raw_url):
         split_idx = _find_credential_colon(raw_url, authority_end + 1)
@@ -539,7 +578,6 @@ class IntelXClient:
                 raise RuntimeError(f"Phonebook result returned non-JSON: {e} | body={safe_body(resp)}")
 
             status, raw_records, normalized = self._extract_records_from_response(payload)
-            last_status = status
 
             # Optional debug dump: always write the *last* response for this query type.
             if debug_dump_path:
@@ -562,20 +600,15 @@ class IntelXClient:
                     batch.append({"raw": r})
 
             # De-dup
-            new_count = 0
             for r in batch:
                 fp = json.dumps(r, sort_keys=True, ensure_ascii=False)
                 if fp in seen:
                     continue
                 seen.add(fp)
                 all_records.append(r)
-                new_count += 1
 
             # Paging / polling logic:
-            if len(batch) == 0:
-                empty_pages_in_a_row += 1
-            else:
-                empty_pages_in_a_row = 0
+            if len(batch) != 0:
                 offset += len(batch)
 
             # If finished, stop (even if records were included in this final response)
@@ -684,6 +717,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--types", default="emails,domains,urls", help="Comma-separated list: emails, domains, urls.")
     p.add_argument("--output-dir", default="output", help="Root output directory.")
+    p.add_argument(
+        "--update",
+        action="store_true",
+        help="Re-run API queries even if local outputs for the query already exist.",
+    )
 
     p.add_argument("--maxresults", type=int, default=10000, help="Phonebook maxresults parameter per search.")
     p.add_argument("--result-limit", type=int, default=200, help="Phonebook result page size (limit parameter).")
@@ -763,6 +801,7 @@ def main() -> int:
     console.print(f"Types         : {', '.join(wanted_types)}")
     console.print(f"Output dir    : {output_root}")
     console.print(f"Rate limit    : {args.rps:.2f} req/s")
+    console.print(f"Update mode   : {'enabled' if args.update else 'disabled'}")
     console.print("")
 
     start_ts = time.time()
@@ -781,7 +820,47 @@ def main() -> int:
         for query in queries:
             console.rule(f"[bold]Query:[/bold] {query}")
             query_dir = os.path.join(output_root, build_query_dirname(query))
-            os.makedirs(query_dir, exist_ok=True)
+            query_dir_exists = os.path.isdir(query_dir)
+            if not query_dir_exists:
+                os.makedirs(query_dir, exist_ok=True)
+
+            # Skip API queries if local outputs already exist (unless --update is set).
+            if query_dir_exists and not args.update:
+                required_files: List[str] = []
+                if "emails" in wanted_types:
+                    required_files.append("emails.txt")
+                if "domains" in wanted_types:
+                    required_files.append("domains.txt")
+                if "urls" in wanted_types:
+                    required_files.append("urls.txt")
+                    required_files.append("credentials.txt")
+
+                if required_files and all(os.path.isfile(os.path.join(query_dir, fn)) for fn in required_files):
+                    console.print("  Skipping API queries: local output files already exist (use --update to refresh).")
+
+                    # Load local outputs so merged outputs can be produced even when skipping API.
+                    if "emails" in wanted_types:
+                        all_emails |= read_lines_set(os.path.join(query_dir, "emails.txt"))
+                    if "domains" in wanted_types:
+                        all_domains |= read_lines_set(os.path.join(query_dir, "domains.txt"))
+                    if "urls" in wanted_types:
+                        all_urls |= read_lines_set(os.path.join(query_dir, "urls.txt"))
+                        all_credentials |= read_lines_set(os.path.join(query_dir, "credentials.txt"))
+
+                    t = Table(title="Query summary (local)", show_header=True, header_style="bold")
+                    t.add_column("Type")
+                    t.add_column("Count", justify="right")
+                    if "emails" in wanted_types:
+                        t.add_row("emails", str(len(read_lines_set(os.path.join(query_dir, "emails.txt")))))
+                    if "domains" in wanted_types:
+                        t.add_row("domains", str(len(read_lines_set(os.path.join(query_dir, "domains.txt")))))
+                    if "urls" in wanted_types:
+                        t.add_row("urls", str(len(read_lines_set(os.path.join(query_dir, "urls.txt")))))
+                        t.add_row("credentials", str(len(read_lines_set(os.path.join(query_dir, "credentials.txt")))))
+                    console.print(t)
+
+                    progress.update(task, advance=1)
+                    continue
 
             query_emails: Set[str] = set()
             query_domains: Set[str] = set()
