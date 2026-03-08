@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -42,11 +43,13 @@ from rich.table import Table
 # -----------------------------
 # IntelX Phonebook constants
 # -----------------------------
+TARGET_ALL = 0
 TARGET_DOMAIN = 1
 TARGET_EMAIL = 2
 TARGET_URL = 3
 
 TYPE_TO_TARGET = {
+    "all": TARGET_ALL,
     "domains": TARGET_DOMAIN,
     "emails": TARGET_EMAIL,
     "urls": TARGET_URL,
@@ -625,19 +628,94 @@ class IntelXClient:
 # -----------------------------
 # Selector extraction
 # -----------------------------
-def extract_selectors(records: List[Dict[str, Any]]) -> Tuple[Set[str], Set[str], Set[str]]:
+def extract_selectors(records: List[Dict[str, Any]]) -> Tuple[Set[str], Set[str], Set[str], Set[str], Set[str]]:
     emails: Set[str] = set()
     domains: Set[str] = set()
     urls: Set[str] = set()
+    ips: Set[str] = set()
+    cidrs: Set[str] = set()
+    metadata_noise_values = {
+        "ip",
+        "ipv4",
+        "ipv6",
+        "cidr",
+        "domain",
+        "domains",
+        "url",
+        "urls",
+        "email",
+        "emails",
+        "selector",
+        "selectortype",
+        "type",
+        "kind",
+        "null",
+        "none",
+        "true",
+        "false",
+    }
+    metadata_noise_keys = {
+        "id",
+        "status",
+        "date",
+        "time",
+        "timestamp",
+        "bucket",
+        "media",
+        "score",
+        "count",
+        "target",
+    }
+
+    def is_noise_value(v: str) -> bool:
+        return v.strip().lower() in metadata_noise_values
+
+    def should_skip_field(key: str | None, value: str) -> bool:
+        key_norm = (key or "").strip().lower()
+        if key_norm in metadata_noise_keys:
+            return True
+        if key_norm.endswith("type"):
+            return True
+        return is_noise_value(value)
 
     def add_email(v: str) -> None:
         v = v.strip()
         if v and "@" in v and " " not in v:
             emails.add(v)
 
+    def add_cidr(v: str) -> bool:
+        raw = v.strip().strip("[]")
+        if not raw or "/" not in raw:
+            return False
+        try:
+            normalized = str(ipaddress.ip_network(raw, strict=False))
+        except ValueError:
+            return False
+        cidrs.add(normalized)
+        return True
+
+    def add_ip(v: str) -> bool:
+        raw = v.strip().strip("[]")
+        if not raw:
+            return False
+        try:
+            normalized = str(ipaddress.ip_address(raw))
+        except ValueError:
+            return False
+        ips.add(normalized)
+        return True
+
     def add_domain(v: str) -> None:
         v = v.strip().lower().rstrip(".")
-        if v and " " not in v and "/" not in v and "@" not in v:
+        if (
+            v
+            and " " not in v
+            and "/" not in v
+            and "@" not in v
+            and not is_noise_value(v)
+            and not add_cidr(v)
+            and not add_ip(v)
+        ):
             domains.add(v)
 
     def add_url(v: str) -> None:
@@ -667,19 +745,26 @@ def extract_selectors(records: List[Dict[str, Any]]) -> Tuple[Set[str], Set[str]
 
         # Best-effort classification
         if isinstance(selector, str):
+            if is_noise_value(selector):
+                continue
             if "@" in selector and " " not in selector:
                 add_email(selector)
             elif "://" in selector or selector.startswith("ftp://") or selector.startswith("magnet:"):
                 add_url(selector)
             elif "/" not in selector and " " not in selector:
                 add_domain(selector)
+            else:
+                add_cidr(selector)
+                add_ip(selector)
 
         # Also scan any other string fields
-        for v in r.values():
+        for key, v in r.items():
             if not isinstance(v, str):
                 continue
             v = html.unescape(v).strip()
             if not v:
+                continue
+            if should_skip_field(str(key), v):
                 continue
             if "@" in v and " " not in v:
                 add_email(v)
@@ -687,8 +772,11 @@ def extract_selectors(records: List[Dict[str, Any]]) -> Tuple[Set[str], Set[str]
                 add_url(v)
             elif "/" not in v and " " not in v:
                 add_domain(v)
+            else:
+                add_cidr(v)
+                add_ip(v)
 
-    return emails, domains, urls
+    return emails, domains, urls, ips, cidrs
 
 
 # -----------------------------
@@ -715,7 +803,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Search term (domain, email, URL, wildcard, etc.) OR a file containing one search term per line.",
     )
-    p.add_argument("--types", default="emails,domains,urls", help="Comma-separated list: emails, domains, urls.")
+    p.add_argument("--types", default="emails,domains,urls,ips,cidrs", help="Comma-separated list: emails, domains, urls, ips, cidrs.")
     p.add_argument("--output-dir", default="output", help="Root output directory.")
     p.add_argument(
         "--update",
@@ -740,11 +828,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def parse_types(types_csv: str) -> List[str]:
     items = [t.strip().lower() for t in types_csv.split(",") if t.strip()]
-    allowed = {"emails", "domains", "urls"}
+    allowed = {"emails", "domains", "urls", "ips", "cidrs"}
     bad = [t for t in items if t not in allowed]
     if bad:
-        raise ValueError(f"Invalid --types value(s): {', '.join(bad)}. Allowed: emails, domains, urls.")
-    order = ["emails", "domains", "urls"]
+        raise ValueError(f"Invalid --types value(s): {', '.join(bad)}. Allowed: emails, domains, urls, ips, cidrs.")
+    order = ["emails", "domains", "urls", "ips", "cidrs"]
     return [t for t in order if t in set(items)]
 
 
@@ -794,6 +882,8 @@ def main() -> int:
     all_domains: Set[str] = set()
     all_urls: Set[str] = set()
     all_credentials: Set[str] = set()
+    all_ips: Set[str] = set()
+    all_cidrs: Set[str] = set()
 
     console.rule("[bold]IntelX Phonebook Extraction[/bold]")
     console.print(f"Base URL      : {args.base_url}")
@@ -834,6 +924,10 @@ def main() -> int:
                 if "urls" in wanted_types:
                     required_files.append("urls.txt")
                     required_files.append("credentials.txt")
+                if "ips" in wanted_types:
+                    required_files.append("ips.txt")
+                if "cidrs" in wanted_types:
+                    required_files.append("cidrs.txt")
 
                 if required_files and all(os.path.isfile(os.path.join(query_dir, fn)) for fn in required_files):
                     console.print("  Skipping API queries: local output files already exist (use --update to refresh).")
@@ -846,6 +940,10 @@ def main() -> int:
                     if "urls" in wanted_types:
                         all_urls |= read_lines_set(os.path.join(query_dir, "urls.txt"))
                         all_credentials |= read_lines_set(os.path.join(query_dir, "credentials.txt"))
+                    if "ips" in wanted_types:
+                        all_ips |= read_lines_set(os.path.join(query_dir, "ips.txt"))
+                    if "cidrs" in wanted_types:
+                        all_cidrs |= read_lines_set(os.path.join(query_dir, "cidrs.txt"))
 
                     t = Table(title="Query summary (local)", show_header=True, header_style="bold")
                     t.add_column("Type")
@@ -857,6 +955,10 @@ def main() -> int:
                     if "urls" in wanted_types:
                         t.add_row("urls", str(len(read_lines_set(os.path.join(query_dir, "urls.txt")))))
                         t.add_row("credentials", str(len(read_lines_set(os.path.join(query_dir, "credentials.txt")))))
+                    if "ips" in wanted_types:
+                        t.add_row("ips", str(len(read_lines_set(os.path.join(query_dir, "ips.txt")))))
+                    if "cidrs" in wanted_types:
+                        t.add_row("cidrs", str(len(read_lines_set(os.path.join(query_dir, "cidrs.txt")))))
                     console.print(t)
 
                     progress.update(task, advance=1)
@@ -866,6 +968,8 @@ def main() -> int:
             query_domains: Set[str] = set()
             query_urls: Set[str] = set()
             query_credentials: Set[str] = set()
+            query_ips: Set[str] = set()
+            query_cidrs: Set[str] = set()
 
             term = query.strip()
             if not term:
@@ -873,72 +977,78 @@ def main() -> int:
                 progress.update(task, advance=1)
                 continue
 
-            for out_type in wanted_types:
-                target = TYPE_TO_TARGET[out_type]
-                console.print(f"- Query type: [bold]{out_type}[/bold] (target={target})")
-                console.print(f"  Starting Phonebook search for term: {term}")
+            console.print(f"- Query mode: [bold]all selectors[/bold] (target={TARGET_ALL})")
+            console.print(f"  Starting Phonebook search for term: {term}")
 
-                search_id = ""
-                try:
-                    search_id = client.phonebook_search(
-                        term=term,
-                        target=target,
-                        maxresults=args.maxresults,
-                        timeout_s=args.pb_timeout,
-                    )
-                    console.print(f"  Search ID: {search_id}")
-                except Exception as e:
-                    console.print(f"  [bold red]Failed[/bold red] to start search: {e}")
-                    continue
-
-                debug_path = None
-                if args.json_debug:
-                    debug_path = os.path.join(query_dir, f"debug_last_{out_type}_{sanitize_for_dirname(term)}.json")
-
-                combined_records: List[Dict[str, Any]] = []
-                try:
-                    records = client.phonebook_fetch_all(
-                        search_id=search_id,
-                        limit=args.result_limit,
-                        poll_interval_s=args.poll_interval,
-                        max_wait_s=args.max_wait,
-                        debug_dump_path=debug_path,
-                    )
-                    combined_records.extend(records)
-                    console.print(f"  Finished: fetched {len(records)} raw record(s)")
-                except TimeoutError as e:
-                    console.print(f"  [bold yellow]Timeout[/bold yellow]: {e}")
-                    if search_id:
-                        client.terminate_search(search_id)
-                        console.print("  Best-effort cleanup: search terminated.")
-                except Exception as e:
-                    console.print(f"  [bold red]Failed[/bold red] to fetch results: {e}")
-                    continue
-
-                # Extract selectors from combined records for this type
-                e_set, d_set, u_set = extract_selectors(combined_records)
-
-                if out_type == "emails":
-                    query_emails |= e_set
-                elif out_type == "domains":
-                    query_domains |= d_set
-                elif out_type == "urls":
-                    sanitized_urls: Set[str] = set()
-                    cred_urls: Set[str] = set()
-                    for u in u_set:
-                        base_url, cred = split_url_credentials(u)
-                        if cred is not None:
-                            cred_urls.add(u)
-                            if base_url:
-                                sanitized_urls.add(base_url)
-                        else:
-                            sanitized_urls.add(u)
-                    query_urls |= sanitized_urls
-                    query_credentials |= cred_urls
-
-                console.print(
-                    f"  Post-processed totals for this query: emails={len(e_set)}, domains={len(d_set)}, urls={len(u_set)}"
+            search_id = ""
+            try:
+                search_id = client.phonebook_search(
+                    term=term,
+                    target=TARGET_ALL,
+                    maxresults=args.maxresults,
+                    timeout_s=args.pb_timeout,
                 )
+                console.print(f"  Search ID: {search_id}")
+            except Exception as e:
+                console.print(f"  [bold red]Failed[/bold red] to start search: {e}")
+                progress.update(task, advance=1)
+                continue
+
+            debug_path = None
+            if args.json_debug:
+                debug_path = os.path.join(query_dir, f"debug_last_all_{sanitize_for_dirname(term)}.json")
+
+            combined_records: List[Dict[str, Any]] = []
+            try:
+                records = client.phonebook_fetch_all(
+                    search_id=search_id,
+                    limit=args.result_limit,
+                    poll_interval_s=args.poll_interval,
+                    max_wait_s=args.max_wait,
+                    debug_dump_path=debug_path,
+                )
+                combined_records.extend(records)
+                console.print(f"  Finished: fetched {len(records)} raw record(s)")
+            except TimeoutError as e:
+                console.print(f"  [bold yellow]Timeout[/bold yellow]: {e}")
+                if search_id:
+                    client.terminate_search(search_id)
+                    console.print("  Best-effort cleanup: search terminated.")
+                progress.update(task, advance=1)
+                continue
+            except Exception as e:
+                console.print(f"  [bold red]Failed[/bold red] to fetch results: {e}")
+                progress.update(task, advance=1)
+                continue
+
+            e_set, d_set, u_set, ip_set, cidr_set = extract_selectors(combined_records)
+
+            if "emails" in wanted_types:
+                query_emails |= e_set
+            if "domains" in wanted_types:
+                query_domains |= d_set
+            if "ips" in wanted_types:
+                query_ips |= ip_set
+            if "cidrs" in wanted_types:
+                query_cidrs |= cidr_set
+            if "urls" in wanted_types:
+                sanitized_urls: Set[str] = set()
+                cred_urls: Set[str] = set()
+                for u in u_set:
+                    base_url, cred = split_url_credentials(u)
+                    if cred is not None:
+                        cred_urls.add(u)
+                        if base_url:
+                            sanitized_urls.add(base_url)
+                    else:
+                        sanitized_urls.add(u)
+                query_urls |= sanitized_urls
+                query_credentials |= cred_urls
+
+            console.print(
+                "  Post-processed totals for this query: "
+                f"emails={len(e_set)}, domains={len(d_set)}, urls={len(u_set)}, ips={len(ip_set)}, cidrs={len(cidr_set)}"
+            )
 
             # Write per-query files (cumulative)
             written: Dict[str, int] = {}
@@ -949,16 +1059,22 @@ def main() -> int:
             if "urls" in wanted_types:
                 written["urls"] = write_sorted_unique(os.path.join(query_dir, "urls.txt"), query_urls)
                 written["credentials"] = write_sorted_unique(os.path.join(query_dir, "credentials.txt"), query_credentials)
+            if "ips" in wanted_types:
+                written["ips"] = write_sorted_unique(os.path.join(query_dir, "ips.txt"), query_ips)
+            if "cidrs" in wanted_types:
+                written["cidrs"] = write_sorted_unique(os.path.join(query_dir, "cidrs.txt"), query_cidrs)
 
             all_emails |= query_emails
             all_domains |= query_domains
             all_urls |= query_urls
             all_credentials |= query_credentials
+            all_ips |= query_ips
+            all_cidrs |= query_cidrs
 
             t = Table(title="Query summary", show_header=True, header_style="bold")
             t.add_column("Type")
             t.add_column("Count", justify="right")
-            for k in ["emails", "domains", "urls"]:
+            for k in ["emails", "domains", "urls", "ips", "cidrs"]:
                 if k in wanted_types:
                     t.add_row(k, str(written.get(k, 0)))
             if "urls" in wanted_types:
@@ -979,6 +1095,12 @@ def main() -> int:
         n_creds = write_sorted_unique(os.path.join(output_root, "credentials_all.txt"), all_credentials)
         console.print(f"- urls_all.txt    : {n_urls}")
         console.print(f"- credentials_all.txt : {n_creds}")
+    if "ips" in wanted_types:
+        n_ips = write_sorted_unique(os.path.join(output_root, "ips_all.txt"), all_ips)
+        console.print(f"- ips_all.txt     : {n_ips}")
+    if "cidrs" in wanted_types:
+        n_cidrs = write_sorted_unique(os.path.join(output_root, "cidrs_all.txt"), all_cidrs)
+        console.print(f"- cidrs_all.txt   : {n_cidrs}")
 
     elapsed = time.time() - start_ts
     console.rule("[bold]Completed[/bold]")

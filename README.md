@@ -5,6 +5,8 @@ Python CLI tool to query **IntelX Phonebook** and extract:
 - Email addresses
 - Domains
 - URLs
+- IPs
+- CIDRs
 - Credentials (credential-bearing URL selectors preserved separately)
 
 It supports a single **query** or a file containing multiple queries, writes per-query outputs, and also produces merged output files in the root output folder.
@@ -31,6 +33,8 @@ IntelX Phonebook is designed to return selectors (emails/domains/URLs) associate
 1. Start a phonebook job: `POST /phonebook/search`
 2. Poll results: `GET /phonebook/search/result` until completion
 
+This tool runs Phonebook with `target=0` (all selectors) once per query and classifies locally, which avoids repeating one API search per selector type.
+
 IntelX requires:
 - Authentication via API key (recommended via the `x-key` header)
 - A valid `User-Agent` identifying your application
@@ -50,7 +54,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Single query (default: emails + domains + urls + credentials)
+### Single query (default: emails + domains + urls + ips + cidrs + credentials)
 
 ```bash
 python intelbook.py --api-key YOUR_INTELX_KEY --query example.com
@@ -70,6 +74,12 @@ python intelbook.py --api-key YOUR_INTELX_KEY --query example.com
 
 ```bash
 python intelbook.py --api-key YOUR_INTELX_KEY --query example.com --types emails,urls
+```
+
+### Domain, URL, IP and CIDR extraction (no emails)
+
+```bash
+python intelbook.py --api-key YOUR_INTELX_KEY --query example.com --types domains,urls,ips,cidrs
 ```
 
 ### Multiple queries from file
@@ -108,6 +118,8 @@ output/
     emails.txt          (optional, cumulative)
     domains.txt         (optional, cumulative)
     urls.txt            (optional, cumulative)
+    ips.txt             (optional, cumulative)
+    cidrs.txt           (optional, cumulative)
     credentials.txt     (optional, cumulative; URLs with credentials/tokens)
 
   <another-query-folder>/
@@ -116,6 +128,8 @@ output/
   emails_all.txt        (optional, cumulative merged)
   domains_all.txt       (optional, cumulative merged)
   urls_all.txt          (optional, cumulative merged)
+  ips_all.txt           (optional, cumulative merged)
+  cidrs_all.txt         (optional, cumulative merged)
   credentials_all.txt   (optional, cumulative merged)
 ```
 
@@ -128,6 +142,7 @@ output/
 * `--result-limit` controls how many records are requested per polling call.
 * `--maxresults` is the phonebook “maxresults” parameter (default 10000).
 * `--json-debug` can be enabled to store raw JSON records per query under each domain folder.
+* `--types` supports: `emails,domains,urls,ips,cidrs`.
 
 ## Exit codes
 
